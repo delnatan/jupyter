@@ -272,6 +272,7 @@ See `jupyter-with-display-buffer'.")
           (special-mode))))
     buffer))
 
+
 (defun jupyter--reset-display-buffer-p (arg)
   "Return non-nil if the current output buffer should be reset.
 If ARG is a `jupyter-request', reset the buffer if ARG's
@@ -288,6 +289,7 @@ If ARG is a `jupyter-request', reset the buffer if ARG's
     ;; Otherwise reset the output buffer if RESET evaluates to a
     ;; non-nil value
     arg))
+
 
 (defmacro jupyter-with-display-buffer (name reset &rest body)
   "In a buffer with a name derived from NAME current, evaluate BODY.
@@ -333,6 +335,7 @@ the output buffer."
            (goto-char jupyter-display-buffer-marker)
            (jupyter-with-control-code-handling ,@body))))))
 
+
 (defun jupyter-display-current-buffer-reuse-window (&optional msg-type alist &rest actions)
   "Convenience function to call `display-buffer' on the `current-buffer'.
 If a window showing the current buffer is already available,
@@ -355,7 +358,10 @@ new window or frame."
           (cons
            (append '(display-buffer-reuse-window)
                    (delq nil actions))
-           alist)))
+	   ;; add reusable-frames entry to search across all frames
+	   ;; also, don't move the cursor from current point
+           (append alist '((reusable-frames . t)
+			   (inhibit-switch-frame . t))))))
     (display-buffer (current-buffer))))
 
 (defun jupyter-pop-up-frame-p (msg-type)
