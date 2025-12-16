@@ -274,7 +274,7 @@ nothing and return nil."
   (when-let* ((context (org-element-context))
               (babel-p (memq (org-element-type context)
                              '(src-block babel-call
-                               inline-babel-call inline-src-block)))
+                                         inline-babel-call inline-src-block)))
               (pos (jupyter-org-element-begin-after-affiliated context))
               (req (get-text-property pos 'jupyter-request)))
     (and (not (jupyter-request-idle-p req))
@@ -359,8 +359,9 @@ to."
 
 (cl-defmethod jupyter-handle-error ((_client jupyter-org-client) (req jupyter-org-request) msg)
   (jupyter-with-message-content msg (traceback)
-    (setq traceback (org-element-normalize-string
-                     (mapconcat #'identity traceback "\n")))
+    (setq traceback (ansi-color-apply ; apply ANSI color
+                     (org-element-normalize-string
+                      (mapconcat #'identity traceback "\n"))))
     (pcase-let (((cl-struct jupyter-org-request inline-block-p silent-p) req))
       (cond
        ((or inline-block-p silent-p)
@@ -382,11 +383,12 @@ to."
         ;; is re-added.
         (unless (memq 'jupyter-org-add-error-keymap org-font-lock-hook)
           (add-hook 'org-font-lock-hook 'jupyter-org-add-error-keymap nil t))
-        (jupyter-org--add-result
-         req (jupyter-org-comment
-              (with-temp-buffer
-                (insert traceback)
-                (jupyter-org--goto-error-string req))))
+        (ignore-errors ;; ignore error
+          (jupyter-org--add-result
+           req (jupyter-org-comment
+                (with-temp-buffer
+                  (insert traceback)
+                  (jupyter-org--goto-error-string req)))))
         (jupyter-org--add-result req traceback))))))
 
 ;;;; Execute result
@@ -800,28 +802,28 @@ and they only take effect when the variable
   (setq lang `[,(or lang 'jupyter)])
   (let ((map (or (lookup-key jupyter-org-interaction-mode-map lang)
                  (define-key jupyter-org-interaction-mode-map lang
-                   (make-sparse-keymap)))))
+                             (make-sparse-keymap)))))
     (define-key map key
-      (let ((cmd (lambda ()
-                   (interactive)
-                   (jupyter-org--call-with-src-block-client def))))
-        (if (symbolp def)
-            (defalias (make-symbol (symbol-name def))
-              cmd (documentation def))
-          cmd))))
+                (let ((cmd (lambda ()
+                             (interactive)
+                             (jupyter-org--call-with-src-block-client def))))
+                  (if (symbolp def)
+                      (defalias (make-symbol (symbol-name def))
+                        cmd (documentation def))
+                    cmd))))
   (let ((jupyter-org--defining-key-p t))
     (unless (functionp (lookup-key jupyter-org-interaction-mode-map key))
       (define-key jupyter-org-interaction-mode-map key
-        (list 'menu-item "" nil :filter
-              (lambda (&rest _)
-                (if jupyter-org--defining-key-p
-                    ;; Stub definition so that `lookup-key' returns a non-nil
-                    ;; value since the normal filter only returns a definition
-                    ;; when inside a source block.  We only need to make the
-                    ;; definition for KEY once and not on every re-definition
-                    ;; of KEY for a particular language.
-                    #'undefined
-                  (jupyter-org--define-key-filter key))))))))
+                  (list 'menu-item "" nil :filter
+                        (lambda (&rest _)
+                          (if jupyter-org--defining-key-p
+                              ;; Stub definition so that `lookup-key' returns a non-nil
+                              ;; value since the normal filter only returns a definition
+                              ;; when inside a source block.  We only need to make the
+                              ;; definition for KEY once and not on every re-definition
+                              ;; of KEY for a particular language.
+                              #'undefined
+                            (jupyter-org--define-key-filter key))))))))
 
 (jupyter-org-define-key (kbd "C-x C-e") #'jupyter-eval-line-or-region)
 (jupyter-org-define-key (kbd "C-M-x") #'jupyter-eval-defun)
@@ -1991,13 +1993,13 @@ Meant to be used as the return value of
           "\n"))
       (when-let* ((results
                    (mapcar (lambda (r)
-                        (if (jupyter-org--stream-result-p r)
-                            (jupyter-org-scalar
-                             (jupyter-org-strip-last-newline r))
-                          r))
-                      (jupyter-org--process-pandoc-results
-                       (mapcar (apply-partially #'jupyter-org-get-result req)
-                          results))))
+                             (if (jupyter-org--stream-result-p r)
+                                 (jupyter-org-scalar
+                                  (jupyter-org-strip-last-newline r))
+                               r))
+                           (jupyter-org--process-pandoc-results
+                            (mapcar (apply-partially #'jupyter-org-get-result req)
+                                    results))))
                   (result-params (alist-get :result-params block-params)))
         (org-element-interpret-data
          (if (or (and (= (length results) 1)
