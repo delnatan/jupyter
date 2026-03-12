@@ -72,12 +72,76 @@
 The unwrapped value is nil."
   (lambda (_state) (cons nil value)))
 
+(defun jupyter-get-client ()
+  "Return a monadic value that returns the client."
+  (jupyter-mlet* ((state (jupyter-get-state)))
+    (let ((client (if (listp state)
+                      (car state)
+                    state)))
+      (cl-check-type client jupyter-kernel-client)
+      (jupyter-return client))))
+
+(defun jupyter-push (s)
+  (jupyter-mlet* ((state (jupyter-get-state)))
+    (jupyter-put-state
+     (cons s (if (listp state) state (list state))))))
+
+(defun jupyter-pop ()
+  (jupyter-mlet* ((state (jupyter-get-state)))
+    (let ((value (if (listp state)
+                     (pop state)
+                   (prog1 state
+                     (setq state nil)))))
+      (jupyter-do
+        (jupyter-put-state state)
+        (jupyter-return value)))))
+
+(defun jupyter-set-client (client)
+  "Return a monadic value that sets the client."
+  (cl-check-type client jupyter-kernel-client)
+  (jupyter-mlet* ((state (jupyter-get-state)))
+    (jupyter-put-state
+     (if (listp state)
+         (cons client (cdr state))
+       client))))
+
+(defun jupyter-at-point (action)
+  "Return a value evaluating ACTION at `point'."
+  (let ((marker (point-marker)))
+    (jupyter-mlet* ((state (jupyter-get-state)))
+      (when (and (marker-buffer marker) (marker-position marker))
+        (unwind-protect
+            (with-current-buffer (marker-buffer marker)
+              (save-excursion
+                (save-restriction
+                  (widen)
+                  (goto-char (marker-position marker))
+                  (jupyter-return
+                    (jupyter-run-with-state state
+                      action)))))
+          (move-marker marker nil))))))
+
 (defun jupyter-bind (mvalue mfn)
   "Bind MVALUE to MFN."
   (declare (indent 1))
   (lambda (state)
     (pcase-let* ((`(,value . ,state) (funcall mvalue state)))
       (funcall (funcall mfn value) state))))
+
+(defmacro jupyter-with-bindings* (varlist action)
+  "Return a monadic value that evaluates ACTION with bound variables.
+VARLIST is a list of variable names, return a monadic value that
+evaluates ACTION with those names bound to their value in the
+context of the evaluation environment where the returned value is
+generated."
+  (declare (indent 1))
+  (let ((syms (mapcar (lambda (_) (gensym)) varlist)))
+    `(let* ,(cl-mapcar (lambda (s v) (list s v)) syms varlist)
+       (jupyter-mlet* ((state (jupyter-get-state)))
+         (let* ,(cl-mapcar (lambda (s v) (list v s)) syms varlist)
+           (jupyter-return
+             (jupyter-run-with-state state
+               ,action)))))))
 
 (defmacro jupyter-mlet* (varlist &rest body)
   "Bind the monadic values in VARLIST, evaluate BODY.
@@ -98,14 +162,13 @@ BODY should be another monadic value."
 The actions are evaluated in the order given.  The result of the
 returned action is the result of the last action in ACTIONS."
   (declare (indent 0) (debug (body)))
-  (if (zerop (length actions)) 'jupyter--return-nil
-    (let ((result (make-symbol "result")))
-      `(jupyter-mlet*
-           ,(cl-loop
-             for action being the elements of actions using (index i)
-             for sym = (if (= i (1- (length actions))) result '_)
-             collect `(,sym ,action))
-         (jupyter-return ,result)))))
+  (cond
+   ((zerop (length actions)) 'jupyter--return-nil)
+   ((= 1 (length actions))
+    (car actions))
+   (t
+    `(jupyter-mlet* ((_ ,(car actions)))
+       (jupyter-do ,@(cdr actions))))))
 
 (defun jupyter-run-with-state (state mvalue)
   "Pass STATE as the state to MVALUE, return the resulting value."
@@ -292,16 +355,16 @@ Ex. Subscribe to a publisher and unsubscribe after receiving two
             (jupyter-publish x)))
       (reverse msgs)) ; => \='(1 2)"
   (declare (indent 0))
-  (lambda (io)
+  (jupyter-mlet* ((io (jupyter-get-state)))
     (funcall io (list 'subscribe sub))
-    (cons nil io)))
+    (jupyter-return nil)))
 
 (defun jupyter-publish (value)
   "Return an I/O action that submits VALUE to publish as content."
   (declare (indent 0))
-  (lambda (io)
+  (jupyter-mlet* ((io (jupyter-get-state)))
     (funcall io (jupyter-content value))
-    (cons nil io)))
+    (jupyter-return nil)))
 
 ;;; Working with requests
 
@@ -479,9 +542,8 @@ list, represents."
             (jupyter-subscribe
               (jupyter-subscriber
                 (lambda (msg)
-                  ;; Only handle what looks to be a Jupyter message.
-                  (when (jupyter-message-type msg)
-                    (let ((channel (plist-get msg :channel)))
+                  (when (jupyter-message-p msg)
+                    (let ((channel (jupyter-message-channel msg)))
                       (jupyter-handle-message client channel msg))))))))
         (cons req client)))))
 

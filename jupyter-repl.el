@@ -776,7 +776,7 @@ POS defaults to `point'."
     (error "Not in code of cell"))
   (1+ (- (point) (jupyter-repl-cell-code-beginning-position))))
 
-(defun jupyter-repl-finalize-cell (req)
+(defun jupyter-repl-finalize-cell (&optional req)
   "Finalize the current input cell.
 REQ is the `jupyter-request' to associate with the current cell.
 Place `point' at `point-max'."
@@ -1200,12 +1200,11 @@ elements."
     (jupyter-repl-without-continuation-prompts
      (goto-char (point-max))
      (let ((shutdown-handled-p (jupyter-repl-cell-finalized-p)))
-       (unless (jupyter-repl-cell-finalized-p)
-         (jupyter-repl-finalize-cell nil))
        ;; Only run the following once.  The Python kernel sends a shutdown-reply
        ;; on both the shell and iopub which is mainly the reason why this is
        ;; needed.
        (unless shutdown-handled-p
+         (jupyter-repl-finalize-cell)
          (jupyter-repl-newline)
          (jupyter-repl-newline)
          (jupyter-with-message-content msg (restart)
@@ -1458,21 +1457,20 @@ this method is called."
 
 (defun jupyter-repl-kill-buffer-query-function ()
   "Ask to shutdown the kernel before killing a REPL buffer.
-If the current client is not connected to a kernel, kill the
-buffer.  If the current client is connected to a kernel, only
-kill the buffer if the user wants to also shutdown the kernel.
-
-Before shutting down the kernel, deactivate
-`jupyter-repl-interaction-mode' in all buffers associated with
-the REPL."
+Any communication to the kernel is disconnected as well.
+Communication can be resumed with `jupyter-connect' if the kernel
+was not shutdown."
   (when (eq major-mode 'jupyter-repl-mode)
-    (let ((connected-p (jupyter-connected-p jupyter-current-client)))
-      (or (not connected-p)
-          (when (y-or-n-p (format "Jupyter REPL (%s) still connected.  Shutdown kernel? "
-                                  (buffer-name (current-buffer))))
-            (jupyter-repl--deactivate-interaction-buffers)
-            (jupyter-shutdown-kernel jupyter-current-client)
-            t)))))
+    (let ((client jupyter-current-client))
+      (when (and (jupyter-kernel-alive-p client)
+                 (y-or-n-p "Shutdown kernel before killing REPL? "))
+        (jupyter-shutdown-kernel client))
+      (jupyter-disconnect client)
+      ;; Unset the REPL buffer, so that `jupyter-bootstrap-repl' can
+      ;; work once again if making a new REPL for the client later on.
+      ;; See also `jupyter-resurrect-repl'.
+      (oset client buffer nil)
+      t)))
 
 (defun jupyter-repl-error-before-major-mode-change ()
   "Error if attempting to change the `major-mode' in a REPL buffer."
@@ -1885,27 +1883,28 @@ it."
   "Synchronize the `jupyter-current-client's kernel state.
 Also update the cell count of the current REPL input prompt using
 the updated state."
-  (jupyter-run-with-client jupyter-current-client
-    (jupyter-mlet* ((_msg (jupyter-reply
-                          (jupyter-execute-request
-                           :code ""
-                           :silent t
-                           :handlers nil)
-                          ;; Waiting longer here to account for initial
-                          ;; startup of the Jupyter kernel.  Sometimes
-                          ;; the idle message won't be received if
-                          ;; another long running execute request is
-                          ;; sent right after.
-                          jupyter-long-timeout))
-                    (client (jupyter-get-state)))
-      (unless (equal (jupyter-execution-state client) "busy")
-        ;; Set the cell count and update the prompt
-        (jupyter-with-repl-buffer client
-          (save-excursion
-            (goto-char (point-max))
-            (jupyter-repl-update-cell-count
-             (oref client execution-count)))))
-      (jupyter-return nil))))
+  (let ((sync
+         (jupyter-idle
+          (jupyter-execute-request
+           :code ""
+           :silent t
+           :handlers nil)
+          ;; Waiting longer here to account for initial startup of the
+          ;; Jupyter kernel.  Sometimes the idle message won't be
+          ;; received if another long running execute request is sent
+          ;; right after.
+          jupyter-long-timeout))
+        (update-cell-count
+         (jupyter-mlet* ((client (jupyter-get-client)))
+           (unless (equal (jupyter-execution-state client) "busy")
+             (jupyter-with-repl-buffer client
+               (save-excursion
+                 (goto-char (point-max))
+                 (jupyter-repl-update-cell-count
+                  (oref client execution-count)))))
+           (jupyter-return nil))))
+    (jupyter-run-with-client jupyter-current-client
+      (jupyter-do sync update-cell-count))))
 
 ;;; `jupyter-repl-interaction-mode'
 
@@ -1977,10 +1976,12 @@ from the kernel."
 (defun jupyter-repl-pop-to-buffer ()
   "Switch to the REPL buffer of the `jupyter-current-client'."
   (interactive)
-  (if jupyter-current-client
-      (jupyter-with-repl-buffer jupyter-current-client
-        (goto-char (point-max))
-        (pop-to-buffer (current-buffer)))
+  (if-let ((client jupyter-current-client))
+      (progn
+        (jupyter-resurrect-repl client)
+        (jupyter-with-repl-buffer client
+          (goto-char (point-max))
+          (pop-to-buffer (current-buffer))))
     (error "Buffer not associated with a REPL, see `jupyter-repl-associate-buffer'")))
 
 (defun jupyter-repl-available-repl-buffers (&optional mode first)
@@ -2122,6 +2123,8 @@ completing all of the above.")
                                       &optional repl-name _associate-buffer _display)
   (prog1 client
     (unless (oref client buffer)
+      ;; Ensure that communication with the kernel can happen.
+      (jupyter-connect client)
       (cl-destructuring-bind (&key language_info
                                    banner
                                    &allow-other-keys)
@@ -2139,6 +2142,16 @@ completing all of the above.")
             (jupyter-repl-mode)
             (jupyter-repl-insert-banner banner)
             (jupyter-repl-insert-prompt 'in)))))))
+
+(defun jupyter-resurrect-repl (client)
+  "Create a new REPL buffer for client if one isn't available.
+Return the REPL buffer."
+  (interactive (list jupyter-current-client))
+  (cl-check-type client jupyter-repl-client)
+  (or (oref client buffer)
+      (progn
+        (jupyter-bootstrap-repl client)
+        (oref client buffer))))
 
 (defvar jupyter--repl-server nil)
 
@@ -2225,14 +2238,7 @@ like the symbol `jupyter-repl-client', which is the default. "
    (jupyter-client
     (jupyter-kernel
      :conn-info file
-     :connect-p t
-     ;; Interrupting a kernel with a message is the only way to
-     ;; interrupt kernels connected to using a connection file since
-     ;; there is no way of telling what kind of kernel it is that is
-     ;; being connected to using this method.  See
-     ;; `jupyter-interrupt-kernel'.
-     :spec (make-jupyter-kernelspec
-            :plist '(:interrupt_mode "message")))
+     :connect-p t)
     client-class)
    repl-name associate-buffer display))
 

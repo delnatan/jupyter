@@ -184,7 +184,7 @@ e.g. `org-babel-get-src-block-info'."
   "Move to the associated marker of REQ while evaluating BODY.
 If the marker points nowhere don't evaluate BODY, just do
 nothing and return nil."
-  (declare (indent 1))
+  (declare (indent 1) (debug (form body)))
   `(pcase-let (((cl-struct jupyter-org-request marker) ,req))
      (when (and (marker-buffer marker) (marker-position marker))
        (org-with-point-at marker
@@ -216,6 +216,11 @@ nothing and return nil."
   (when (overlayp (jupyter-org-request-overlay req))
     (delete-overlay (jupyter-org-request-overlay req))))
 
+(defun jupyter-org-inline-block-p (&optional context)
+  (or context (setq context (org-element-context)))
+  (memq (org-element-type context)
+        '(inline-babel-call inline-src-block)))
+
 (cl-defmethod jupyter-generate-request ((_client jupyter-org-client) &rest slots)
   "Return a `jupyter-org-request' for the current source code block."
   (if (and org-babel-current-src-block-location
@@ -239,9 +244,7 @@ nothing and return nil."
                        (append
                         (list
                          :marker (copy-marker org-babel-current-src-block-location)
-                         :inline-block-p (and (memq (org-element-type context)
-                                                    '(inline-babel-call inline-src-block))
-                                              t)
+                         :inline-block-p (jupyter-org-inline-block-p context)
                          :result-type (alist-get :result-type block-params)
                          :file (alist-get :file block-params)
                          :block-params block-params
@@ -691,20 +694,31 @@ nil."
     (`(invalid . ,_) nil)
     (`(,params . ,_) params)))
 
+(defun jupyter-org-src-block-client (&optional previous initiate params)
+  "Return the `jupyter-kernel-client' for the current source block.
+nil is returned when `point' doesn't lie in a Jupyter source
+block.  If PREVIOUS is non-nil, return the client for the
+previously visited source block in the `current-buffer'.  If
+INITIATE is non-nil, initialize a client first if one doesn't
+already exist and return it, otherwise nil is returned.
+
+If PARAMS is non-nil, it should be the pre-calculated
+`jupyter-org-src-block-params' for the source block whose client
+is being retrieved."
+  (when-let* ((params (or params (jupyter-org-src-block-params previous)))
+              (buffer (and (or initiate
+                               (org-babel-jupyter-session-initiated-p
+                                params 'noerror))
+                           (org-babel-jupyter-initiate-session
+                            (alist-get :session params) params))))
+    (buffer-local-value 'jupyter-current-client buffer)))
+
 (defun jupyter-org--with-src-block-client (thunk)
-  (when-let* ((params (jupyter-org-src-block-params))
-              (buffer
-               (and (or jupyter-org-auto-connect
-                        (org-babel-jupyter-session-initiated-p
-                         params 'noerror))
-                    (org-babel-jupyter-initiate-session
-                     (alist-get :session params) params)))
-              (client (or (buffer-local-value
-                           'jupyter-current-client buffer)
-                          (error "No client in session buffer!")))
-              (syntax (jupyter-kernel-language-syntax-table client)))
+  (when-let* ((client (jupyter-org-src-block-client
+                       nil jupyter-org-auto-connect)))
     (let ((jupyter-current-client client))
-      (with-syntax-table syntax
+      (with-syntax-table
+          (jupyter-kernel-language-syntax-table client)
         (funcall thunk)))))
 
 (defmacro jupyter-org-with-src-block-client (&rest body)
@@ -1089,10 +1103,8 @@ Otherwise, return VALUE formated as a fixed-width `org-element'."
             org-babel-min-lines-for-block-output)
         (jupyter-org-example-block value)
       (org-element-create 'fixed-width (list :value value))))
-   ((and (listp value)
-         (or (memq (car value) org-element-all-objects)
-             (memq (car value) org-element-all-elements)))
-    value)
+   ;; plain-text handled by above.
+   ((jupyter-org-element-p value) value)
    ((and (listp value)
          (jupyter-org-tabulablep value))
     (jupyter-org-table-string (jupyter-org-table-to-orgtbl value)))
@@ -1375,7 +1387,7 @@ new \"scalar\" result with the result of calling
      (cond
       ((and (stringp result)
             ;; Don't assume non-empty string, see #144
-            (not (zerop (length result)))
+            (not (string-empty-p result))
             ;; Don't attempt to create a table when we just want scalar results
             ;; FIXME: `jupyter-org-scalar' also considers a table a scalar, but
             ;; `org-mode' doesn't.
@@ -1390,7 +1402,13 @@ new \"scalar\" result with the result of calling
                                (?\{ ?\})
                                (?\( ?\)))))
               (eq end (aref result (1- (length result))))))
-       (org-babel-script-escape result))
+       (if-let* ((escaped (org-babel-script-escape result)))
+           escaped
+         ;; Just return result when it looks like "()" which
+         ;; `org-babel-script-escape' turns into nil, otherwise
+         ;; `jupyter-org-scalar' will consider it as
+         ;; (jupyter-org-table-string "\n")
+         result))
       (t result)))))
 
 (cl-defmethod jupyter-org-result ((_mime (eql :text/plain)) content _params)
@@ -1478,9 +1496,12 @@ appear after the element."
            ;; `jupyter-org-scalar'.
            (get-text-property 0 'org-table result))
       (memq (org-element-type result)
-            '(example-block
-              export-block fixed-width item
-              link plain-list src-block table))))
+            '(link
+              ;; Taken from `org-babel-result-end', excludes table.
+              ;; XXX Why exclude table?
+              drawer example-block export-block fixed-width
+              special-block src-block item plain-list
+              latex-environment))))
 
 (defun jupyter-org--strip-properties (element)
   "Strip away properties which may interfere with insertion of ELEM."
@@ -1808,41 +1829,44 @@ If INDENTATION is nil, it defaults to `current-indentation'."
                             'org-latex-overlay))
           (org-latex-preview))))))
 
+(defun jupyter-org-insert-result (req result)
+  (pcase-let (((cl-struct jupyter-org-request
+                          inline-block-p block-params client)
+               req))
+    (jupyter-org-with-point-at req
+      (if inline-block-p
+          (org-babel-insert-result
+           (if (stringp result) result
+             (or (org-element-property :value result) ""))
+           (alist-get :result-params block-params)
+           nil nil (jupyter-kernel-language client))
+        (let ((res-begin (org-babel-where-is-src-block-result 'insert)))
+          (goto-char res-begin)
+          (let ((context (org-element-context))
+                (indent (current-indentation)))
+            ;; Handle file links which are org element objects and are contained
+            ;; within paragraph contexts.
+            (when (eq (org-element-type context) 'paragraph)
+              (save-excursion
+                (goto-char (jupyter-org-element-begin-after-affiliated context))
+                (when (looking-at-p (format "^[ \t]*%s[ \t]*$" org-link-bracket-re))
+                  (setq context (org-element-context)))))
+            ;; Skip past the #+RESULTS line
+            (forward-line 1)
+            (unless (bolp) (insert "\n"))
+            (jupyter-org-indent-inserted-region indent
+              (if (jupyter-org--stream-result-p result)
+                  (jupyter-org--insert-stream context result)
+                (when (eq (org-element-type result) 'pandoc)
+                  (setq result (jupyter-org-pandoc-placeholder-element req result)))
+                (jupyter-org--insert-nonstream context result)))))))))
+
 (defun jupyter-org-inserted-result (data &optional metadata)
   "Return a monadic value that inserts DATA and METADATA as an Org element."
   (jupyter-mlet* ((req (jupyter-get-state)))
-    (pcase-let (((cl-struct jupyter-org-request
-                            inline-block-p block-params client)
-                 req))
-      (let ((result (jupyter-org-get-result req data metadata)))
-        (jupyter-org-with-point-at req
-          (if inline-block-p
-              (org-babel-insert-result
-               (if (stringp result) result
-                 (or (org-element-property :value result) ""))
-               (alist-get :result-params block-params)
-               nil nil (jupyter-kernel-language client))
-            (let ((res-begin (org-babel-where-is-src-block-result 'insert)))
-              (goto-char res-begin)
-              (let ((context (org-element-context))
-                    (indent (current-indentation)))
-                ;; Handle file links which are org element objects and are contained
-                ;; within paragraph contexts.
-                (when (eq (org-element-type context) 'paragraph)
-                  (save-excursion
-                    (goto-char (jupyter-org-element-begin-after-affiliated context))
-                    (when (looking-at-p (format "^[ \t]*%s[ \t]*$" org-link-bracket-re))
-                      (setq context (org-element-context)))))
-                ;; Skip past the #+RESULTS line
-                (forward-line 1)
-                (unless (bolp) (insert "\n"))
-                (jupyter-org-indent-inserted-region indent
-                  (if (jupyter-org--stream-result-p result)
-                      (jupyter-org--insert-stream context result)
-                    (when (eq (org-element-type result) 'pandoc)
-                      (setq result (jupyter-org-pandoc-placeholder-element req result)))
-                    (jupyter-org--insert-nonstream context result)))))))
-        (jupyter-return result)))))
+    (let ((result (jupyter-org-get-result req data metadata)))
+      (jupyter-org-insert-result req result)
+      (jupyter-return result))))
 
 (defun jupyter-org--start-pandoc-conversion (el cb)
   (jupyter-pandoc-convert

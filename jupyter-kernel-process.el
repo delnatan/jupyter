@@ -95,7 +95,8 @@ Call the next method if ARGS does not contain a :spec or
 :conn-info key."
   (if (plist-get args :server) (cl-call-next-method)
     (let ((spec (plist-get args :spec))
-          (conn-info (plist-get args :conn-info)))
+          (conn-info (plist-get args :conn-info))
+          (connect-p (plist-get args :connect-p)))
       (cond
        ((and spec (not conn-info))
         (when (stringp spec)
@@ -105,6 +106,19 @@ Call the next method if ARGS does not contain a :spec or
         (cl-check-type (plist-get args :spec) jupyter-kernelspec)
         (apply #'jupyter-kernel-process args))
        (conn-info
+        (when connect-p
+          ;; No need for a kernelspec if connecting to a kernel, in
+          ;; this case kernel information can be had from the
+          ;; "kernel_info_request".
+          (cl-assert (null spec))
+          ;; Interrupting a kernel with a message is the only way to
+          ;; interrupt kernels connected to using a connection file
+          ;; since there is no way of telling what kind of kernel it
+          ;; is that is being connected to using this method.  See
+          ;; `jupyter-interrupt-kernel'.
+          (plist-put args :spec
+                     (make-jupyter-kernelspec
+                      :plist '(:interrupt_mode "message"))))
         (apply #'jupyter-kernel-process
                :session (if (stringp conn-info)
                             (jupyter-connection-file-to-session conn-info)
@@ -274,11 +288,12 @@ Call the next method if ARGS does not contain a :spec or
   (setq jupyter--kernel-processes
         (cl-loop for (p conn-file) in jupyter--kernel-processes
                  if (process-live-p p) collect (list p conn-file)
-                 else do (delete-process p)
+                 else do
+                 (delete-process p)
                  (when (file-exists-p conn-file)
                    (delete-file conn-file))
-                 and when (buffer-live-p (process-buffer p))
-                 do (kill-buffer (process-buffer p)))))
+                 (when (buffer-live-p (process-buffer p))
+                   (kill-buffer (process-buffer p))))))
 
 (defun jupyter-delete-connection-files ()
   "Delete all connection files created by Emacs."
