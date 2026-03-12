@@ -2103,20 +2103,20 @@ Image(filename='%s', width=300)" file)
       (when (file-exists-p image-file-name)
         (delete-file image-file-name)))))
 
-(ert-deftest jupyter-org-result ()
+(ert-deftest jupyter-org-get-result ()
   :tags '(org)
-  (let ((req (jupyter-org-request)))
-    (let ((res (jupyter-org-result req (list :text/plain "foo"))))
+  (let ((req (jupyter-org-request :marker (jupyter-org-test (point-marker)))))
+    (let ((res (jupyter-org-get-result req (list :text/plain "foo"))))
       (should (eq (org-element-type res) 'fixed-width))
       (should (equal (org-element-property :value res) "foo")))
-    (let ((res (jupyter-org-result req (list :text/html "foo"))))
+    (let ((res (jupyter-org-get-result req (list :text/html "foo"))))
       (should (eq (org-element-type res) 'export-block))
       (should (equal (org-element-property :type res) "html"))
       (should (equal (org-element-property :value res) "foo\n")))
     ;; Calls `org-babel-script-escape' for scalar data
-    (should (equal (jupyter-org-result req (list :text/plain "[1, 2, 3]"))
+    (should (equal (jupyter-org-get-result req (list :text/plain "[1, 2, 3]"))
                    "| 1 | 2 | 3 |\n"))
-    (let ((res (jupyter-org-result req (list :text/plain "[1, 2, 3] Foo"))))
+    (let ((res (jupyter-org-get-result req (list :text/plain "[1, 2, 3] Foo"))))
       (should (eq (org-element-type res) 'fixed-width))
       (should (equal (org-element-property :value res) "[1, 2, 3] Foo")))))
 
@@ -2141,7 +2141,7 @@ Image(filename='%s', width=300)" file)
   ;; `org-babel-python-table-or-string', this is more of a test for method
   ;; order.
   (cl-letf* ((py-method-called nil)
-             (req (jupyter-org-request))
+             (req (jupyter-org-request :marker (jupyter-org-test (point-marker))))
              ((symbol-function #'org-babel-python-table-or-string)
               (lambda (results)
                 (setq py-method-called t)
@@ -2152,7 +2152,7 @@ Image(filename='%s', width=300)" file)
     (should (equal (jupyter-kernel-language jupyter-current-client) 'python))
     ;; Bring in the python specific methods
     (jupyter-load-language-support jupyter-current-client)
-    (should (equal (jupyter-org-result req (list :text/plain "[1, 2, 3]"))
+    (should (equal (jupyter-org-get-result req (list :text/plain "[1, 2, 3]"))
                    "| 1 | 2 | 3 |\n"))
     (should py-method-called)))
 
@@ -2170,10 +2170,10 @@ Image(filename='%s', width=300)" file)
      (forward-line)
      (end-of-line)
      (should-not jupyter-org--src-block-cache)
-     (should-not (jupyter-org--same-src-block-p))
-     (jupyter-org--set-current-src-block)
+     (should-not (jupyter-org--at-cached-src-block-p))
+     (jupyter-org--set-src-block-cache)
      (should jupyter-org--src-block-cache)
-     (should (jupyter-org--same-src-block-p))
+     (should (jupyter-org--at-cached-src-block-p))
      (cl-destructuring-bind (params beg end)
          jupyter-org--src-block-cache
        (should (equal (alist-get :session params) jupyter-org-test-session))
@@ -2226,44 +2226,6 @@ Image(filename='%s', width=300)" file)
      (should-not (jupyter-org-when-in-src-block t))
      (forward-line)
      (should-not (jupyter-org-when-in-src-block t)))))
-
-(ert-deftest jupyter-org--stream-context-p ()
-  :tags '(org)
-  (with-temp-buffer
-    (org-mode)
-    (dolist
-        (res '(("\
-#+RESULTS:
-:RESULTS:
-: Foo
-:END:" . 27)
-               ("\
-#+RESULTS:
-: Foo
-" . 17)
-               ("\
-#+RESULTS:
-#+BEGIN_EXAMPLE
-Foo
-#+END_EXAMPLE
-" . 31)
-               ("\
-#+RESULTS:
-:RESULTS:
-#+BEGIN_EXAMPLE
-Foo
-#+END_EXAMPLE
-:END:
-" . 41)
-               ("\
-#+RESULTS:
-file:foo
-" . nil)))
-      (insert (car res))
-      (if (cdr res)
-          (should (= (jupyter-org--stream-context-p (org-element-at-point)) (cdr res)))
-        (should-not (jupyter-org--stream-context-p (org-element-at-point))))
-      (erase-buffer))))
 
 (ert-deftest jupyter-org--append-to-fixed-width ()
   :tags '(org)
@@ -3048,6 +3010,38 @@ print(2)"
            (kill-buffer (org-babel-jupyter-initiate-session
                          (alist-get :session params) params))))))))
 
+(ert-deftest org-babel-jupyer-issue-565 ()
+  :tags '(org)
+  (jupyter-org-test-src-block
+   "\
+import logging
+import time
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+for i in range(10):
+    log.info(\"here\")
+    time.sleep(0.1)
+
+{1: 2}"
+   "\
+:RESULTS:
+#+begin_example
+  INFO:__main__:here
+  INFO:__main__:here
+  INFO:__main__:here
+  INFO:__main__:here
+  INFO:__main__:here
+  INFO:__main__:here
+  INFO:__main__:here
+  INFO:__main__:here
+  INFO:__main__:here
+  INFO:__main__:here
+#+end_example
+| 1: | 2 |
+:END:
+"
+   :async "yes"))
+
 (ert-deftest org-babel-src-block-name-resolution ()
   :tags '(org)
   (let ((src (format "\
@@ -3143,6 +3137,5 @@ raise Exception(\"This is an error\")
 
 ;; Local Variables:
 ;; byte-compile-warnings: (unresolved obsolete lexical)
-;; eval: (and (functionp 'aggressive-indent-mode) (aggressive-indent-mode -1))
 ;; End:
 ;;; jupyter-test.el ends here
